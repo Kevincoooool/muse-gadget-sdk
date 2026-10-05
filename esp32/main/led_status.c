@@ -32,7 +32,8 @@
 #include "driver/ledc.h"
 #elif CONFIG_HOMEHUB_LED_BACKEND_DEVKIT_GPIO27
 #include "led_strip.h"
-#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING
+#include "soc/spi_pins.h"
+#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
 #include "driver/gpio.h"
 #include "led_strip.h"
 #elif CONFIG_HOMEHUB_DISPLAY
@@ -73,17 +74,38 @@ static const char *TAG = "link.led";
 #define LED_PWM_FREQ  5000
 #define LED_PWM_RES   LEDC_TIMER_8_BIT
 #elif CONFIG_HOMEHUB_LED_BACKEND_DEVKIT_GPIO27
-// ESP32-C5 DevKitC-1 onboard addressable RGB LED. The separate red power LED
-// is always on when USB-powered and is not firmware-controlled.
-#define LED_STRIP_GPIO       27
+// Single addressable RGB LED, GPIO27 on the ESP32-C5 DevKitC-1. The DevKitC-1's
+// separate red power LED is always on when USB-powered and is not
+// firmware-controlled.
+#define LED_STRIP_GPIO       CONFIG_HOMEHUB_LED_STRIP_GPIO
+// Routing the LED to a flash or PSRAM pin takes that pin off the memory bus the
+// chip runs from, so refuse the build. GPIO27, the default, is one on the S3.
+#if LED_STRIP_GPIO == MSPI_IOMUX_PIN_NUM_CLK || LED_STRIP_GPIO == MSPI_IOMUX_PIN_NUM_CS0 \
+    || LED_STRIP_GPIO == MSPI_IOMUX_PIN_NUM_MISO || LED_STRIP_GPIO == MSPI_IOMUX_PIN_NUM_MOSI \
+    || LED_STRIP_GPIO == MSPI_IOMUX_PIN_NUM_HD || LED_STRIP_GPIO == MSPI_IOMUX_PIN_NUM_WP
+#error "CONFIG_HOMEHUB_LED_STRIP_GPIO is an SPI flash pin on this chip"
+#endif
+#if CONFIG_SPIRAM && defined(MSPI_IOMUX_PIN_NUM_CS1) && LED_STRIP_GPIO == MSPI_IOMUX_PIN_NUM_CS1
+#error "CONFIG_HOMEHUB_LED_STRIP_GPIO is the PSRAM chip select on this chip"
+#endif
+#if (CONFIG_SPIRAM_MODE_OCT || CONFIG_ESPTOOLPY_OCT_FLASH) && defined(MSPI_IOMUX_PIN_NUM_D4) \
+    && LED_STRIP_GPIO >= MSPI_IOMUX_PIN_NUM_D4 && LED_STRIP_GPIO <= MSPI_IOMUX_PIN_NUM_DQS
+#error "CONFIG_HOMEHUB_LED_STRIP_GPIO is an octal flash/PSRAM pin on this chip"
+#endif
 #define LED_STRIP_LED_COUNT  1
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
-#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING
+#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
 // Home Assistant Voice PE: 12 WS2812 LEDs in a ring, index 0 at the top and
 // counting clockwise, powered through a switch on GPIO45.
+#if CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
+// Seeed vendor pinout: XIAO D0=GPIO1; one WS2812, no power switch.
+#define RING_GPIO            1
+#define RING_LEDS            1
+#else
 #define RING_GPIO            21
 #define RING_POWER_GPIO      45
 #define RING_LEDS            12
+#endif
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
 // How long the ring stays green after connecting before it goes dark.
 #define RING_CONNECTED_MS    3000
@@ -284,11 +306,10 @@ static bool led_hw_init(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "LED status ready: ESP32-C5 DevKitC-1 addressable RGB (GPIO=%d)",
-             LED_STRIP_GPIO);
+    ESP_LOGI(TAG, "LED status ready: addressable RGB (GPIO=%d)", LED_STRIP_GPIO);
     return true;
 }
-#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING
+#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
 static led_strip_handle_t s_strip = NULL;
 // Steady frames shown since the ring last turned green for "connected".
 static int s_connected_frames = 0;
@@ -319,12 +340,15 @@ static void led_hw_set_connected(void) {
 }
 
 static bool led_hw_init(void) {
+    esp_err_t err = ESP_OK;
+#if CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING
     gpio_config_t power_cfg = {
         .pin_bit_mask = 1ULL << RING_POWER_GPIO,
         .mode = GPIO_MODE_OUTPUT,
     };
-    esp_err_t err = gpio_config(&power_cfg);
+    err = gpio_config(&power_cfg);
     if (err == ESP_OK) err = gpio_set_level(RING_POWER_GPIO, 1);
+#endif
 
     led_strip_config_t strip_cfg = {
         .strip_gpio_num = RING_GPIO,
@@ -344,7 +368,7 @@ static bool led_hw_init(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "LED status ready: Voice PE %d-LED ring (GPIO=%d)", RING_LEDS, RING_GPIO);
+    ESP_LOGI(TAG, "LED status ready: %d addressable LED(s) (GPIO=%d)", RING_LEDS, RING_GPIO);
     return true;
 }
 #elif CONFIG_HOMEHUB_DISPLAY
@@ -851,7 +875,7 @@ static bool led_hw_init(void) {
 #endif
 
 #if !CONFIG_HOMEHUB_DISPLAY
-#if !CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING
+#if !(CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE)
 static void led_hw_set_connected(void) {
     led_hw_set_color(COLOR_GREEN);
 }
@@ -909,6 +933,7 @@ static rgb_t scaled(rgb_t c, float level) {
 // A bright head going clockwise, one LED per two frames, with a fading tail.
 static void ring_comet(rgb_t *px, int frame, rgb_t c, int tail) {
     int head = (frame / 2) % RING_LEDS;
+    if (tail > RING_LEDS) tail = RING_LEDS;
     for (int k = 0; k < tail; k++) {
         px[(head - k + RING_LEDS) % RING_LEDS] = scaled(c, (float)(tail - k) / tail);
     }
@@ -1080,7 +1105,7 @@ bool led_status_init(void) {
 
     led_hw_set_color(COLOR_ORANGE);
     // 2026-09-20: increase margin; measured only 904 bytes free with a 2048-byte stack.
-#if CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING
+#if CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
     // The RMT ring driver takes about 2 KB of the task's stack per frame.
     const uint32_t stack = 4096;
 #else
