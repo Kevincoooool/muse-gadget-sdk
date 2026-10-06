@@ -230,6 +230,7 @@ struct turn_t {
     char committed[512];     /* finals that arrived before the half-close */
     char partial[512];
     char user_ids[2][80];
+    muse_chat_rejected_t rejected;
     msg_t msgs[MAX_MSGS];
     int nmsgs;
     bool agent_busy;
@@ -928,7 +929,8 @@ static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out
         size_t i = r->pos >> 16;
         int32_t a = i ? in[i - 1] : r->prev;
         int32_t b = in[i];
-        out[o++] = a + (((b - a) * (int32_t)(r->pos & 0xffff)) >> 16);
+        /* (b - a) spans 17 bits and the fraction 16, so the product needs 64. */
+        out[o++] = (int16_t)(a + (int32_t)(((int64_t)(b - a) * (int64_t)(r->pos & 0xffff)) >> 16));
         r->pos += r->step;
     }
     r->pos -= n << 16;
@@ -1294,6 +1296,9 @@ static bool is_user_id(const char *id)
 /* The message `id` if it belongs to this turn, binding it on first sight; else -1. */
 static int bind_msg(const char *id, cJSON *payload)
 {
+    if (muse_chat_is_rejected(&s_turn.rejected, id)) {
+        return -1;
+    }
     int i = find_msg(id);
     if (i >= 0 || s_turn.phase != P_WAIT_REPLY) {
         return i;
@@ -1304,6 +1309,10 @@ static int bind_msg(const char *id, cJSON *payload)
     }
     /* Once the ack names our message, replies to anything else are someone else's. */
     if (parent && parent[0] && s_turn.acked && !is_user_id(parent) && find_msg(parent) < 0) {
+        muse_chat_reject(&s_turn.rejected, id);
+        return -1;
+    }
+    if ((!parent || !parent[0]) && s_turn.rejected.overflow) {
         return -1;
     }
     if (s_turn.nmsgs == MAX_MSGS) {
